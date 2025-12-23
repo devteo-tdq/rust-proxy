@@ -4,6 +4,7 @@ use colored::*;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex}; // Thêm thư viện để chia sẻ dữ liệu giữa các luồng
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -14,10 +15,11 @@ use url::Url;
 
 // --- CẤU HÌNH ---
 const DEFAULT_POOL: &str = "stratum+tcp://pool.supportxmr.com:8080";
+// Lưu ý: Thay địa chỉ ví của bạn vào đây nếu cần
 const DEFAULT_WALLET: &str = "44hQZfLkTccVGood4aYMTm1KPyJVoa9esLyq1bneAvhkchQdmFTx3rsD3KRwpXTUPd1iTF4VVGYsTCLYrxMZVsvtKqAmBiw";
 const DEFAULT_PASS: &str = "MyWorker";
 const LISTEN_PORT: u16 = 9000;
-const CHANNEL_SIZE: usize = 1024; // Giới hạn hàng đợi tin nhắn
+const CHANNEL_SIZE: usize = 1024;
 
 // --- GLOBAL STATS (ATOMIC - LOCK FREE) ---
 static ACCEPTED: AtomicU64 = AtomicU64::new(0);
@@ -65,14 +67,12 @@ async fn main() -> Result<()> {
     log_net("Note: WebSocket Server (ws://). Use 'ulimit -n 65535' for 1000+ connections.");
 
     while let Ok((stream, _)) = listener.accept().await {
-        // Tối ưu TCP: Tắt Nagle algorithm để giảm độ trễ
+        // Tối ưu TCP: Tắt Nagle algorithm
         if let Err(e) = stream.set_nodelay(true) {
-            // Lỗi nhỏ không cần dừng chương trình
             eprintln!("Failed to set nodelay: {}", e);
         }
 
         tokio::spawn(async move {
-            // Bỏ qua lỗi kết nối để tránh spam log
             let _ = handle_client(stream).await;
         });
     }
@@ -80,7 +80,6 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_client(stream: TcpStream) -> Result<()> {
-    // Callback chấp nhận mọi Header
     let callback = |req: &Request, response: Response| {
         log_net(&format!("New Client: {}", req.uri()));
         Ok(response)
@@ -92,6 +91,9 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
     // Channel nội bộ
     let (tx_ws_internal, mut rx_ws_internal) = mpsc::channel::<String>(CHANNEL_SIZE);
     let mut tx_pool: Option<mpsc::Sender<String>> = None;
+
+    // --- FIX: Biến lưu trữ Session ID của Pool (Shared State) ---
+    let pool_session_id = Arc::new(Mutex::new(String::new()));
 
     loop {
         tokio::select! {
@@ -111,7 +113,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                         if let Some((id, method, params)) = parsed {
                             match method.as_str() {
                                 "login" => {
-                                    // Xử lý Login
+                                    // Lấy ví từ miner gửi lên hoặc dùng default
                                     let _wallet = params.as_array()
                                         .and_then(|a| a.get(0))
                                         .and_then(|a| a.as_array())
@@ -119,16 +121,15 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or(DEFAULT_WALLET);
 
+                                    // Cấu hình Pool
                                     let pool_url = Url::parse(DEFAULT_POOL)?;
-                                    let host = pool_url.host_str().unwrap_or("us.salvium.herominers.com");
-                                    let port = pool_url.port().unwrap_or(1230);
+                                    let host = pool_url.host_str().unwrap_or("pool.supportxmr.com");
+                                    let port = pool_url.port().unwrap_or(8080);
                                     let pool_addr = format!("{}:{}", host, port);
 
                                     match TcpStream::connect(&pool_addr).await {
                                         Ok(tcp_stream) => {
-                                            // Tắt Nagle cho kết nối Pool
                                             let _ = tcp_stream.set_nodelay(true);
-                                            
                                             log_net(&format!("Connected to pool {}", pool_addr));
                                             
                                             let (tcp_read, mut tcp_write) = tcp_stream.into_split();
@@ -137,8 +138,10 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
 
                                             // Task Đọc từ Pool
                                             let tx_ws_clone = tx_ws_internal.clone();
+                                            // Clone biến lưu Session ID để đưa vào task đọc
+                                            let session_storage_clone = pool_session_id.clone(); 
+
                                             tokio::spawn(async move {
-                                                // Buffer 8KB
                                                 let mut reader = BufReader::with_capacity(8 * 1024, tcp_read);
                                                 let mut line = String::with_capacity(1024);
                                                 
@@ -146,7 +149,8 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                                     let trimmed = line.trim();
                                                     if !trimmed.is_empty() {
                                                         if let Ok(pool_json) = serde_json::from_str::<Value>(trimmed) {
-                                                            process_pool_message(pool_json, &tx_ws_clone).await;
+                                                            // Truyền thêm biến lưu session
+                                                            process_pool_message(pool_json, &tx_ws_clone, &session_storage_clone).await;
                                                         }
                                                     }
                                                     line.clear();
@@ -190,13 +194,26 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                     if let Some(tx) = &tx_pool {
                                         if let Some(arr) = params.as_array() {
                                             if arr.len() >= 3 {
+                                                // --- FIX: Lấy Worker ID chính xác ---
+                                                let worker_id = {
+                                                    let lock = pool_session_id.lock().unwrap();
+                                                    lock.clone()
+                                                };
+                                                
+                                                // Nếu chưa có ID (chưa login xong) thì dùng tạm arr[0]
+                                                let final_worker_id = if worker_id.is_empty() {
+                                                    arr[0].as_str().unwrap_or("").to_string()
+                                                } else {
+                                                    worker_id
+                                                };
+
                                                 let submit_req = json!({
                                                     "id": id,
                                                     "jsonrpc": "2.0",
                                                     "method": "submit",
                                                     "params": {
-                                                        "id": arr[0],
-                                                        "job_id": arr[0],
+                                                        "id": final_worker_id, // Session ID đúng của Pool
+                                                        "job_id": arr[0],      // Job ID của job hiện tại
                                                         "nonce": arr[1],
                                                         "result": arr[2]
                                                     }
@@ -229,7 +246,8 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn process_pool_message(pool_json: Value, tx_ws: &mpsc::Sender<String>) {
+// --- FIX: Thêm tham số session_storage để lưu ID ---
+async fn process_pool_message(pool_json: Value, tx_ws: &mpsc::Sender<String>, session_storage: &Arc<Mutex<String>>) {
     if let Some(method) = pool_json.get("method") {
         if method == "job" {
             if let Some(params) = pool_json.get("params") {
@@ -239,20 +257,34 @@ async fn process_pool_message(pool_json: Value, tx_ws: &mpsc::Sender<String>) {
     } 
     else if let Some(result) = pool_json.get("result") {
         let id_val = pool_json.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        
+        // Phản hồi cho gói tin Login (ID = 1)
         if id_val == 1 {
+            // --- FIX: Bóc tách và lưu Session ID ---
+            if let Some(sid) = result.get("id") {
+                if let Some(s) = sid.as_str() {
+                    let mut lock = session_storage.lock().unwrap();
+                    *lock = s.to_string();
+                }
+            }
+            // ---------------------------------------
+
             if let Some(job) = result.get("job") {
                 let _ = tx_ws.send(json!([id_val, null, { "id": 0, "job": job }]).to_string()).await;
-                log_net("Miner Logged In");
+                log_net("Miner Logged In & Authorized");
             } else {
                 let _ = tx_ws.send(json!([id_val, null, "OK"]).to_string()).await;
+                log_net("Miner Logged In (No Initial Job)");
             }
         } else {
+            // Phản hồi cho các gói tin Submit
             let _ = tx_ws.send(json!([id_val, null, "OK"]).to_string()).await;
         }
     } 
     else if let Some(err) = pool_json.get("error") {
         if !err.is_null() {
             let id_val = pool_json.get("id").unwrap_or(&json!(null));
+            log_err(&format!("Pool Error: {}", err));
             let _ = tx_ws.send(json!([id_val, err, null]).to_string()).await;
         }
     }
