@@ -15,7 +15,7 @@ use url::Url;
 // --- CẤU HÌNH ---
 const DEFAULT_POOL: &str = "stratum+tcp://pool.supportxmr.com:8080";
 const DEFAULT_WALLET: &str = "44hQZfLkTccVGood4aYMTm1KPyJVoa9esLyq1bneAvhkchQdmFTx3rsD3KRwpXTUPd1iTF4VVGYsTCLYrxMZVsvtKqAmBiw";
-const DEFAULT_PASS: &str = "x";
+const DEFAULT_PASS: &str = "MyWorker";
 const LISTEN_PORT: u16 = 9000;
 const CHANNEL_SIZE: usize = 1024; // Giới hạn hàng đợi tin nhắn
 
