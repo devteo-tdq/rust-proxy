@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 // --- CẤU HÌNH ---
-const DEFAULT_POOL: &str = "stratum+tcp://pool.supportxmr.com:3333";
+const DEFAULT_POOL: &str = "stratum+tcp://pool.supportxmr.com:8080";
 const DEFAULT_WALLET: &str = "SC11rezQ11DLX63oNaZD3Z5ggonmtfyehVhyjb1bFeLMB7emmGhDodc268uvcT87HTYsqqi4mzkZmQB4xgNeBRCf84CCygp9vQ.madeByDevTeo";
 const DEFAULT_PASS: &str = "x";
 const LISTEN_PORT: u16 = 9000;
