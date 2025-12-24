@@ -15,8 +15,9 @@ use url::Url;
 
 // --- CẤU HÌNH ---
 const DEFAULT_POOL: &str = "stratum+tcp://pool.supportxmr.com:8080";
+// Thay địa chỉ ví của bạn vào đây
 const DEFAULT_WALLET: &str = "44hQZfLkTccVGood4aYMTm1KPyJVoa9esLyq1bneAvhkchQdmFTx3rsD3KRwpXTUPd1iTF4VVGYsTCLYrxMZVsvtKqAmBiw";
-const DEFAULT_PASS: &str = "ProxyWorker"; // Đổi tên worker cho dễ nhận diện
+const DEFAULT_PASS: &str = "ProxyWorker";
 const LISTEN_PORT: u16 = 9000;
 const CHANNEL_SIZE: usize = 2048; // Tăng nhẹ buffer cho ổn định
 
@@ -61,9 +62,10 @@ async fn main() -> Result<()> {
     let addr = format!("0.0.0.0:{}", LISTEN_PORT);
     let listener = TcpListener::bind(&addr).await?;
     
-    log_net(&format!("RANDOMX PROXY (Anti-Ban Fix) listening on {}", LISTEN_PORT));
+    log_net(&format!("RANDOMX PROXY (Protocol Fix) listening on {}", LISTEN_PORT));
     
     while let Ok((stream, _)) = listener.accept().await {
+        // Tối ưu TCP
         if let Err(e) = stream.set_nodelay(true) {
             eprintln!("Failed to set nodelay: {}", e);
         }
@@ -76,7 +78,7 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_client(stream: TcpStream) -> Result<()> {
-    // Callback giữ nguyên như code bạn gửi (vì nó đang hoạt động tốt với miner của bạn)
+    // Callback giữ nguyên như code cũ của bạn (để miner kết nối được)
     let callback = |req: &Request, response: Response| {
         log_net(&format!("New Client: {}", req.uri()));
         Ok(response)
@@ -88,6 +90,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
     let (tx_ws_internal, mut rx_ws_internal) = mpsc::channel::<String>(CHANNEL_SIZE);
     let mut tx_pool: Option<mpsc::Sender<String>> = None;
 
+    // Biến lưu Session ID (Worker ID)
     let pool_session_id = Arc::new(Mutex::new(String::new()));
 
     loop {
@@ -106,6 +109,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                         if let Some((id, method, params)) = parsed {
                             match method.as_str() {
                                 "login" => {
+                                    // Lấy ví từ miner
                                     let _wallet = params.as_array()
                                         .and_then(|a| a.get(0))
                                         .and_then(|a| a.as_array())
@@ -113,6 +117,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or(DEFAULT_WALLET);
 
+                                    // Kết nối Pool
                                     let pool_url = Url::parse(DEFAULT_POOL)?;
                                     let host = pool_url.host_str().unwrap_or("pool.supportxmr.com");
                                     let port = pool_url.port().unwrap_or(8080);
@@ -133,6 +138,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                             tokio::spawn(async move {
                                                 let mut reader = BufReader::with_capacity(8 * 1024, tcp_read);
                                                 let mut line = String::with_capacity(2048);
+                                                
                                                 while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
                                                     let trimmed = line.trim();
                                                     if !trimmed.is_empty() {
@@ -153,9 +159,8 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                                 }
                                             });
 
-                                            // --- SỬA QUAN TRỌNG: GÓI TIN LOGIN CHUẨN XMRIG ---
-                                            // 1. Đổi agent thành XMRig để Pool tin tưởng
-                                            // 2. Thêm trường "algo": ["rx/0"] (Đây là lý do bạn bị ban nếu thiếu)
+                                            // --- SỬA QUAN TRỌNG NHẤT Ở ĐÂY ---
+                                            // Gói tin Login chuẩn XMRig để tránh bị BAN
                                             let login_req = json!({
                                                 "id": 1,
                                                 "jsonrpc": "2.0",
@@ -163,8 +168,8 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                                 "params": {
                                                     "login": DEFAULT_WALLET,
                                                     "pass": DEFAULT_PASS,
-                                                    "agent": "XMRig/6.22.0 (Proxy)", 
-                                                    "algo": ["rx/0", "cn/1", "cn/2", "rx/wow"],
+                                                    "agent": "XMRig/6.22.0 (Proxy)", // Giả danh XMRig
+                                                    "algo": ["rx/0"],                // QUAN TRỌNG: Khai báo RandomX
                                                     "rigid": "proxy"
                                                 }
                                             });
@@ -195,7 +200,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                                     worker_id
                                                 };
 
-                                                // --- SỬA NHỎ: Thêm algo vào submit cho chắc ---
+                                                // Gói tin submit chuẩn
                                                 let submit_req = json!({
                                                     "id": id,
                                                     "jsonrpc": "2.0",
@@ -205,7 +210,7 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
                                                         "job_id": arr[0],
                                                         "nonce": arr[1],
                                                         "result": arr[2],
-                                                        "algo": "rx/0" // Thêm cái này cho chuẩn protocol
+                                                        "algo": "rx/0" // Thêm algo cho chắc chắn
                                                     }
                                                 });
                                                 
@@ -248,6 +253,7 @@ async fn process_pool_message(pool_json: Value, tx_ws: &mpsc::Sender<String>, se
         let id_val = pool_json.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
         
         if id_val == 1 {
+            // LƯU SESSION ID
             if let Some(sid) = result.get("id") {
                 if let Some(s) = sid.as_str() {
                     let mut lock = session_storage.lock().unwrap();
@@ -257,18 +263,17 @@ async fn process_pool_message(pool_json: Value, tx_ws: &mpsc::Sender<String>, se
 
             if let Some(job) = result.get("job") {
                 let _ = tx_ws.send(json!([id_val, null, { "id": 0, "job": job }]).to_string()).await;
-                log_net("Miner Logged In (Authorized)");
+                log_net("Miner Logged In & Authorized");
             } else {
                 let _ = tx_ws.send(json!([id_val, null, "OK"]).to_string()).await;
                 log_net("Miner Logged In");
             }
         } else {
-            // Kiểm tra status từ Pool để log chính xác hơn
-             if let Some(status) = result.get("status") {
-                 if status != "OK" {
-                     // Nếu pool báo lỗi (ví dụ low diff)
-                     log_err(&format!("Share rejected by pool: {}", status));
-                 }
+            // Log nếu share bị reject
+            if let Some(status) = result.get("status") {
+                if status != "OK" {
+                    log_err(&format!("Share Rejected: {}", status));
+                }
             }
             let _ = tx_ws.send(json!([id_val, null, "OK"]).to_string()).await;
         }
@@ -277,7 +282,7 @@ async fn process_pool_message(pool_json: Value, tx_ws: &mpsc::Sender<String>, se
         if !err.is_null() {
             let id_val = pool_json.get("id").unwrap_or(&json!(null));
             if let Some(msg) = err.get("message") {
-                log_err(&format!("Pool returned Error: {}", msg));
+                log_err(&format!("Pool Error: {}", msg));
             }
             let _ = tx_ws.send(json!([id_val, err, null]).to_string()).await;
         }
